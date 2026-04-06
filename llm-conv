@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# llm-conv — thin wrapper around the `llm` CLI that streams responses
+# while appending a nicely formatted markdown log for llm-live-preview.
+#
+# Usage (same flags as `llm`):
+#   llm-conv "What is the derivative of sin(x)?"
+#   llm-conv -c "And the integral?"           # continue conversation
+#   llm-conv -s "You are a maths tutor" "..."  # with system prompt
+#
+# Set LLM_PREVIEW_FILE to change the output file (default: ./conversation.md)
+# Set LLM_CONV_MODEL  to pin a model          (default: llm's default)
+
+set -euo pipefail
+
+FILE="${LLM_PREVIEW_FILE:-conversation.md}"
+
+# ---- build the llm command args, also extract the prompt text ----------
+declare -a LLM_ARGS=()
+MODEL_FLAGS=()
+PROMPT=""
+CONTINUE=0
+i=1
+while [[ $i -le $# ]]; do
+    arg="${!i}"
+    case "$arg" in
+        -c|--continue)
+            CONTINUE=1
+            LLM_ARGS+=("$arg")
+            ;;
+        -m|--model)
+            i=$((i+1)); val="${!i}"
+            LLM_ARGS+=("$arg" "$val")
+            ;;
+        -s|--system)
+            i=$((i+1)); val="${!i}"
+            LLM_ARGS+=("$arg" "$val")
+            ;;
+        -o|--option)
+            i=$((i+1)); val="${!i}"
+            LLM_ARGS+=("$arg" "$val")
+            ;;
+        -*)
+            LLM_ARGS+=("$arg")
+            ;;
+        *)
+            # First bare argument is the prompt
+            if [[ -z "$PROMPT" ]]; then
+                PROMPT="$arg"
+            fi
+            LLM_ARGS+=("$arg")
+            ;;
+    esac
+    i=$((i+1))
+done
+
+# ---- If starting fresh (no -c), write a header -------------------------
+if [[ $CONTINUE -eq 0 && ! -f "$FILE" ]]; then
+    printf '# Conversation\n\n' > "$FILE"
+fi
+
+# ---- Append the "You" block --------------------------------------------
+if [[ -n "$PROMPT" ]]; then
+    printf '\n---\n\n**You:** %s\n\n**Assistant:**\n\n' "$PROMPT" >> "$FILE"
+fi
+
+# ---- Stream llm output, tee to file ------------------------------------
+llm "${LLM_ARGS[@]}" | tee -a "$FILE"
+
+# Ensure a trailing newline
+printf '\n' >> "$FILE"
