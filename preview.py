@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-llm-live-preview: Auto-refreshing markdown+LaTeX preview.
+llm-live-preview: Auto-refreshing markdown+LaTeX preview with input bar.
 
 Usage:
     python3 preview.py [file.md] [--port 8765] [--no-browser]
 
 The server watches the file, rerenders it with pandoc+MathJax on every
 save, and tells the browser to reload via Server-Sent Events.
+Type prompts in the bottom bar to continue the conversation.
 """
 
 import argparse
+import json
 import os
 import queue
 import re
@@ -19,7 +21,6 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # SSE broadcast — one queue per connected browser tab
@@ -45,21 +46,25 @@ def _broadcast(msg: str) -> None:
 _html = ""
 _html_lock = threading.Lock()
 
-_RELOAD_JS = """\
-<script>
-(function () {
-  var es = new EventSource('/events');
-  es.onmessage = function (e) { if (e.data === 'reload') location.reload(); };
-  es.onerror   = function ()  { setTimeout(function () { location.reload(); }, 2000); };
-})();
-</script>"""
+# ---------------------------------------------------------------------------
+# Conversation state
+# ---------------------------------------------------------------------------
+_md_file = "conversation.md"
+_running = False
+_running_lock = threading.Lock()
+_conversation_started = False
+_conv_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Injected HTML/CSS/JS
+# ---------------------------------------------------------------------------
 
 _MATHJAX = '<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>'
 
 _EXTRA_CSS = """\
 <style>
 body {
-  max-width: 860px; margin: 2rem auto; padding: 0 1.5rem;
+  max-width: 860px; margin: 2rem auto; padding: 0 1.5rem 140px;
   font-family: Georgia, "Times New Roman", serif;
   font-size: 1.25rem; line-height: 1.5; color: #1a1a1a;
 }
@@ -75,16 +80,113 @@ blockquote { border-left: 3px solid #bbb; margin-left: 0;
              padding-left: 1em; color: #555; }
 </style>"""
 
-_EMPTY_HTML = """\
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>llm-live-preview</title>{css}</head>
-<body><p style="color:#888;font-family:sans-serif">
-Waiting for content — write to the file to begin.</p>
-{js}</body></html>""".format(css=_EXTRA_CSS, js=_RELOAD_JS)
+_INPUT_BAR = """\
+<div id="llm-bar">
+  <textarea id="llm-input" placeholder="Message… (Ctrl+Enter to send)" rows="3"></textarea>
+  <div id="llm-bar-buttons">
+    <span id="llm-status"></span>
+    <button id="llm-new-btn" title="Start a new conversation">New</button>
+    <button id="llm-send-btn">Send</button>
+  </div>
+</div>
+<style>
+#llm-bar {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: #fff; border-top: 1px solid #ddd;
+  padding: 0.6rem 1rem; display: flex; gap: 0.6rem;
+  align-items: flex-end; box-shadow: 0 -2px 8px rgba(0,0,0,0.07);
+  box-sizing: border-box;
+}
+#llm-input {
+  flex: 1; font-family: Georgia, serif; font-size: 1rem;
+  border: 1px solid #ccc; border-radius: 4px;
+  padding: 0.45rem 0.6rem; resize: vertical;
+  min-height: 2.4rem; line-height: 1.4;
+}
+#llm-bar-buttons { display: flex; flex-direction: column; gap: 0.3rem; align-items: flex-end; }
+#llm-send-btn, #llm-new-btn {
+  font-size: 0.85rem; padding: 0.3rem 0.9rem;
+  border-radius: 4px; border: 1px solid #aaa; cursor: pointer; white-space: nowrap;
+}
+#llm-send-btn { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+#llm-send-btn:disabled { opacity: 0.4; cursor: default; }
+#llm-input:disabled { opacity: 0.6; }
+#llm-new-btn { background: #f5f5f5; }
+#llm-new-btn:hover { background: #eaeaea; }
+#llm-status { font-size: 0.78rem; color: #999; font-family: sans-serif; min-height: 1em; text-align: right; }
+</style>
+<script>
+(function () {
+  var BUSY_KEY = 'llm-busy';
+  var TEXT_KEY = 'llm-text';
+  var inp  = document.getElementById('llm-input');
+  var send = document.getElementById('llm-send-btn');
+  var nw   = document.getElementById('llm-new-btn');
+  var stat = document.getElementById('llm-status');
+
+  inp.value = sessionStorage.getItem(TEXT_KEY) || '';
+
+  function setBusy(on) {
+    inp.disabled = send.disabled = on;
+    stat.textContent = on ? 'Generating…' : '';
+    on ? sessionStorage.setItem(BUSY_KEY, '1') : sessionStorage.removeItem(BUSY_KEY);
+  }
+
+  if (sessionStorage.getItem(BUSY_KEY)) setBusy(true);
+
+  var es = new EventSource('/events');
+  es.onmessage = function (e) {
+    if (e.data === 'reload') {
+      sessionStorage.setItem(TEXT_KEY, inp.value);
+      location.reload();
+    } else if (e.data === 'done') {
+      setBusy(false);
+      sessionStorage.removeItem(TEXT_KEY);
+    }
+  };
+  es.onerror = function () { setTimeout(function () { location.reload(); }, 2000); };
+
+  function doSend() {
+    var text = inp.value.trim();
+    if (!text || inp.disabled) return;
+    setBusy(true);
+    sessionStorage.removeItem(TEXT_KEY);
+    fetch('/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt: text})
+    }).then(function (r) {
+      if (r.status === 409) { setBusy(false); stat.textContent = 'Busy…'; }
+    }).catch(function () { setBusy(false); stat.textContent = 'Error'; });
+  }
+
+  send.addEventListener('click', doSend);
+  inp.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSend(); }
+  });
+  nw.addEventListener('click', function () {
+    fetch('/reset', {method: 'POST'});
+    sessionStorage.removeItem(BUSY_KEY);
+    sessionStorage.removeItem(TEXT_KEY);
+    setBusy(false);
+    inp.value = '';
+  });
+})();
+</script>"""
+
+_EMPTY_HTML = (
+    '<!DOCTYPE html><html><head><meta charset="utf-8">'
+    '<title>llm-live-preview</title>'
+    + _EXTRA_CSS
+    + '</head><body><p style="color:#888;font-family:sans-serif">'
+    'Waiting for content — type below to begin.</p>'
+    + _INPUT_BAR
+    + '</body></html>'
+)
 
 
 def _render(md_file: str) -> str:
-    """Run pandoc, inject CSS + reload script, return full HTML."""
+    """Run pandoc, inject CSS + input bar, return full HTML."""
     result = subprocess.run(
         ["pandoc", md_file, "--standalone", "--mathjax", "-f", "markdown"],
         capture_output=True,
@@ -97,11 +199,10 @@ def _render(md_file: str) -> str:
             + "</pre></body></html>"
         )
     html = result.stdout
-    # Strip pandoc's injected MathJax scripts (local v2, broken without config)
     html = re.sub(r'<script[^>]*polyfill\.io[^>]*></script>\s*', '', html)
     html = re.sub(r'<script[^>]*MathJax\.js[^>]*>\s*</script>\s*', '', html)
     html = html.replace("</head>", _MATHJAX + "\n" + _EXTRA_CSS + "\n</head>", 1)
-    html = html.replace("</body>", _RELOAD_JS + "\n</body>", 1)
+    html = html.replace("</body>", _INPUT_BAR + "\n</body>", 1)
     return html
 
 
@@ -124,6 +225,32 @@ def _watch(md_file: str, interval: float = 0.8) -> None:
         except FileNotFoundError:
             pass
         time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# llm-conv runner
+# ---------------------------------------------------------------------------
+
+def _run_llm(prompt: str) -> None:
+    global _running, _conversation_started
+    llm_conv = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm-conv')
+    args = [llm_conv]
+    with _conv_lock:
+        if _conversation_started:
+            args.append('-c')
+    args.append(prompt)
+
+    env = os.environ.copy()
+    env['LLM_PREVIEW_FILE'] = os.path.abspath(_md_file)
+
+    try:
+        subprocess.run(args, env=env)
+    finally:
+        with _conv_lock:
+            _conversation_started = True
+        with _running_lock:
+            _running = False
+        _broadcast('done')
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +284,6 @@ class _Handler(BaseHTTPRequestHandler):
                         self.wfile.write(f"data: {msg}\n\n".encode())
                         self.wfile.flush()
                     except queue.Empty:
-                        # Keepalive comment so the connection stays open
                         self.wfile.write(b": ka\n\n")
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -170,8 +296,49 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self) -> None:
+        global _running, _conversation_started
+
+        if self.path == "/send":
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                prompt = json.loads(body).get('prompt', '').strip()
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if not prompt:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            with _running_lock:
+                if _running:
+                    self.send_response(409)
+                    self.end_headers()
+                    return
+                _running = True
+
+            self.send_response(200)
+            self.end_headers()
+            threading.Thread(target=_run_llm, args=(prompt,), daemon=True).start()
+
+        elif self.path == "/reset":
+            with _conv_lock:
+                _conversation_started = False
+            with open(_md_file, 'w') as f:
+                f.write('# Conversation\n\n')
+            self.send_response(200)
+            self.end_headers()
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, *_) -> None:
-        pass  # silence access log
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +346,8 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _html, _md_file
+
     ap = argparse.ArgumentParser(
         description="Live pandoc+MathJax preview for markdown files"
     )
@@ -192,21 +361,19 @@ def main() -> None:
     ap.add_argument("--no-browser", action="store_true", help="Don't open browser")
     args = ap.parse_args()
 
-    md_file = args.file
+    _md_file = args.file
 
-    if not os.path.exists(md_file):
-        #Path(md_file).write_text("# Conversation\n\n")
-        print(f"Created {md_file}")
+    if os.path.exists(_md_file):
+        _html = _render(_md_file)
+    else:
+        _html = _EMPTY_HTML
 
-    global _html
-    _html = _render(md_file)
-
-    watcher = threading.Thread(target=_watch, args=(md_file,), daemon=True)
+    watcher = threading.Thread(target=_watch, args=(_md_file,), daemon=True)
     watcher.start()
 
     server = ThreadingHTTPServer(("localhost", args.port), _Handler)
     url = f"http://localhost:{args.port}"
-    print(f"Watching : {md_file}")
+    print(f"Watching : {_md_file}")
     print(f"Preview  : {url}")
     print("Ctrl+C to stop.\n")
 
