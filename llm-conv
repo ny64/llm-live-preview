@@ -1,70 +1,80 @@
 #!/usr/bin/env bash
 # llm-conv — thin wrapper around the `llm` CLI that streams responses
-# while appending a nicely formatted markdown log for llm-live-preview.
+# while keeping conversation.md in sync for llm-live-preview.
 #
 # Usage (same flags as `llm`):
 #   llm-conv "What is the derivative of sin(x)?"
 #   llm-conv -c "And the integral?"           # continue conversation
-#   llm-conv -s "You are a maths tutor" "..."  # with system prompt
+#   llm-conv chat                             # interactive chat session
+#   llm-conv -m gpt-4o "Explain Fourier"      # pick a model
 #
 # Set LLM_PREVIEW_FILE to change the output file (default: ./conversation.md)
-# Set LLM_CONV_MODEL  to pin a model          (default: llm's default)
 
 set -euo pipefail
 
 FILE="${LLM_PREVIEW_FILE:-conversation.md}"
 
-# ---- build the llm command args, also extract the prompt text ----------
-declare -a LLM_ARGS=()
-MODEL_FLAGS=()
-PROMPT=""
-CONTINUE=0
-i=1
-while [[ $i -le $# ]]; do
-    arg="${!i}"
-    case "$arg" in
-        -c|--continue)
-            CONTINUE=1
-            LLM_ARGS+=("$arg")
-            ;;
-        -m|--model)
-            i=$((i+1)); val="${!i}"
-            LLM_ARGS+=("$arg" "$val")
-            ;;
-        -s|--system)
-            i=$((i+1)); val="${!i}"
-            LLM_ARGS+=("$arg" "$val")
-            ;;
-        -o|--option)
-            i=$((i+1)); val="${!i}"
-            LLM_ARGS+=("$arg" "$val")
-            ;;
-        -*)
-            LLM_ARGS+=("$arg")
-            ;;
-        *)
-            # First bare argument is the prompt
-            if [[ -z "$PROMPT" ]]; then
-                PROMPT="$arg"
-            fi
-            LLM_ARGS+=("$arg")
-            ;;
-    esac
-    i=$((i+1))
+# Python snippet to rewrite FILE from the full conversation log
+_PYREWRITE='
+import json, os, subprocess
+conv_id = os.environ["CONV_ID"]
+out_file = os.environ["FILE"]
+result = subprocess.run(
+    ["llm", "logs", "list", "--conversation", conv_id, "-n", "0", "--json"],
+    capture_output=True, text=True
+)
+if result.returncode != 0 or not result.stdout.strip():
+    exit()
+entries = json.loads(result.stdout)
+lines = ["# Conversation"]
+for entry in entries:
+    prompt = entry.get("prompt") or ""
+    response = entry.get("response") or ""
+    lines.append("\n---\n")
+    lines.append(f"**You:** {prompt}\n")
+    lines.append(f"**Assistant:**\n\n{response}")
+with open(out_file, "w") as f:
+    f.write("\n".join(lines) + "\n")
+'
+
+_latest_conv_id() {
+    llm logs list -n 1 --json | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['conversation_id'])"
+}
+
+_rewrite() {
+    CONV_ID="$1" FILE="$FILE" python3 -c "$_PYREWRITE"
+}
+
+# ---- Detect chat subcommand ------------------------------------------------
+IS_CHAT=0
+for arg in "$@"; do
+    [[ "$arg" == "chat" ]] && IS_CHAT=1 && break
 done
 
-# ---- If starting fresh (no -c), write a header -------------------------
-if [[ $CONTINUE -eq 0 && ! -f "$FILE" ]]; then
-    printf '# Conversation\n\n' > "$FILE"
+# ---- Run llm ---------------------------------------------------------------
+if [[ $IS_CHAT -eq 1 ]]; then
+    # Chat mode: background poller rewrites the file every 2 s while chatting
+    (
+        set +e
+        while true; do
+            sleep 2
+            ID=$(llm logs list -n 1 --json 2>/dev/null \
+                | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['conversation_id'])" 2>/dev/null) || continue
+            [[ -z "$ID" ]] && continue
+            CONV_ID="$ID" FILE="$FILE" python3 -c "$_PYREWRITE" 2>/dev/null || true
+        done
+    ) &
+    POLL_PID=$!
+
+    llm "$@" || true
+
+    kill "$POLL_PID" 2>/dev/null || true
+    wait "$POLL_PID" 2>/dev/null || true
+else
+    # Prompt mode: tee for live streaming, rewrite from logs after for prompts
+    llm "$@" | tee -a "$FILE"
+    printf '\n' >> "$FILE"
 fi
 
-# ---- Append the "You" block --------------------------------------------
-if [[ -n "$PROMPT" ]]; then
-    printf '\n---\n\n**You:** %s\n\n**Assistant:**\n\n' "$PROMPT" >> "$FILE"
-fi
-
-# ---- Stream llm output, tee to file ------------------------------------
-llm "${LLM_ARGS[@]}" | tee -a "$FILE"
-
-# Ensure a trailing newline
-printf '\n' >> "$FILE"
+# ---- Final rewrite from full conversation log ------------------------------
+_rewrite "$(_latest_conv_id)"
