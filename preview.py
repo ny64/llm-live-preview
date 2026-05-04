@@ -15,8 +15,8 @@ import json
 import os
 import queue
 import re
+import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import webbrowser
@@ -54,6 +54,8 @@ _running = False
 _running_lock = threading.Lock()
 _conversation_started = False
 _conv_lock = threading.Lock()
+_current_model = "claude-opus-4.7"
+_model_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Injected HTML/CSS/JS
@@ -64,7 +66,7 @@ _MATHJAX = '<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js
 _EXTRA_CSS = """\
 <style>
 body {
-  max-width: 860px; margin: 2rem auto; padding: 0 1.5rem 140px;
+  max-width: 860px; margin: 2rem auto; padding: 0 1.5rem 160px;
   font-family: Georgia, "Times New Roman", serif;
   font-size: 1.25rem; line-height: 1.5; color: #1a1a1a;
 }
@@ -83,12 +85,29 @@ blockquote { border-left: 3px solid #bbb; margin-left: 0;
 _INPUT_BAR = """\
 <div id="llm-bar">
   <textarea id="llm-input" placeholder="Message… (Ctrl+Enter to send)" rows="3"></textarea>
-  <div id="llm-bar-buttons">
-    <span id="llm-status"></span>
-    <button id="llm-new-btn" title="Start a new conversation">New</button>
-    <button id="llm-send-btn">Send</button>
+  <div id="llm-bar-right">
+    <div id="llm-bar-top">
+      <select id="llm-model-select" title="Model"></select>
+      <button id="llm-history-btn" title="Conversation history">&#128203;</button>
+      <button id="llm-new-btn" title="Start a new conversation">New</button>
+      <button id="llm-send-btn">Send</button>
+    </div>
+    <div id="llm-bar-bottom">
+      <span id="llm-status"></span>
+    </div>
   </div>
 </div>
+
+<!-- Conversations panel -->
+<div id="llm-conv-panel" style="display:none">
+  <div id="llm-conv-header">
+    <span>Conversations</span>
+    <button id="llm-conv-close" title="Close">&times;</button>
+  </div>
+  <div id="llm-conv-list"></div>
+</div>
+<div id="llm-conv-overlay" style="display:none"></div>
+
 <style>
 #llm-bar {
   position: fixed; bottom: 0; left: 0; right: 0;
@@ -103,29 +122,110 @@ _INPUT_BAR = """\
   padding: 0.45rem 0.6rem; resize: vertical;
   min-height: 2.4rem; line-height: 1.4;
 }
-#llm-bar-buttons { display: flex; flex-direction: column; gap: 0.3rem; align-items: flex-end; }
-#llm-send-btn, #llm-new-btn {
+#llm-bar-right { display: flex; flex-direction: column; gap: 0.3rem; align-items: flex-end; }
+#llm-bar-top { display: flex; gap: 0.4rem; align-items: center; }
+#llm-bar-bottom { align-self: flex-end; }
+#llm-send-btn, #llm-new-btn, #llm-history-btn {
   font-size: 0.85rem; padding: 0.3rem 0.9rem;
   border-radius: 4px; border: 1px solid #aaa; cursor: pointer; white-space: nowrap;
 }
 #llm-send-btn { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
 #llm-send-btn:disabled { opacity: 0.4; cursor: default; }
 #llm-input:disabled { opacity: 0.6; }
-#llm-new-btn { background: #f5f5f5; }
-#llm-new-btn:hover { background: #eaeaea; }
+#llm-new-btn, #llm-history-btn { background: #f5f5f5; }
+#llm-new-btn:hover, #llm-history-btn:hover { background: #eaeaea; }
+#llm-model-select {
+  font-size: 0.82rem; padding: 0.25rem 0.5rem;
+  border-radius: 4px; border: 1px solid #ccc; background: #fafafa;
+  cursor: pointer; max-width: 220px;
+}
 #llm-status { font-size: 0.78rem; color: #999; font-family: sans-serif; min-height: 1em; text-align: right; }
+
+/* Conversations panel */
+#llm-conv-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 900;
+}
+#llm-conv-panel {
+  position: fixed; right: 0; top: 0; bottom: 0; width: 360px; max-width: 95vw;
+  background: #fff; border-left: 1px solid #ddd; z-index: 901;
+  display: flex; flex-direction: column; box-shadow: -4px 0 16px rgba(0,0,0,0.12);
+}
+#llm-conv-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0.8rem 1rem; border-bottom: 1px solid #eee;
+  font-family: sans-serif; font-weight: 600; font-size: 0.95rem;
+}
+#llm-conv-close {
+  background: none; border: none; font-size: 1.4rem; cursor: pointer;
+  color: #666; line-height: 1; padding: 0 0.2rem;
+}
+#llm-conv-close:hover { color: #111; }
+#llm-conv-list { flex: 1; overflow-y: auto; padding: 0.5rem 0; }
+.conv-item {
+  padding: 0.6rem 1rem; border-bottom: 1px solid #f0f0f0;
+  display: flex; gap: 0.5rem; align-items: flex-start;
+  cursor: pointer; font-family: sans-serif;
+}
+.conv-item:hover { background: #f7f7f7; }
+.conv-item.active { background: #eef4ff; }
+.conv-info { flex: 1; min-width: 0; }
+.conv-name {
+  font-size: 0.88rem; font-weight: 500; color: #111;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conv-meta { font-size: 0.75rem; color: #888; margin-top: 0.15rem; }
+.conv-del {
+  background: none; border: none; color: #bbb; cursor: pointer;
+  font-size: 1rem; padding: 0.1rem 0.3rem; border-radius: 3px; flex-shrink: 0;
+}
+.conv-del:hover { color: #c0392b; background: #fdecea; }
+#llm-conv-empty { padding: 1.5rem 1rem; font-family: sans-serif; font-size: 0.88rem; color: #999; }
+#llm-conv-loading { padding: 1rem; font-family: sans-serif; font-size: 0.85rem; color: #aaa; }
 </style>
+
 <script>
 (function () {
-  var BUSY_KEY = 'llm-busy';
-  var TEXT_KEY = 'llm-text';
-  var inp  = document.getElementById('llm-input');
-  var send = document.getElementById('llm-send-btn');
-  var nw   = document.getElementById('llm-new-btn');
-  var stat = document.getElementById('llm-status');
+  var BUSY_KEY  = 'llm-busy';
+  var TEXT_KEY  = 'llm-text';
+  var MODEL_KEY = 'llm-model';
+
+  var inp   = document.getElementById('llm-input');
+  var send  = document.getElementById('llm-send-btn');
+  var nw    = document.getElementById('llm-new-btn');
+  var hist  = document.getElementById('llm-history-btn');
+  var stat  = document.getElementById('llm-status');
+  var msel  = document.getElementById('llm-model-select');
+  var panel = document.getElementById('llm-conv-panel');
+  var overlay = document.getElementById('llm-conv-overlay');
+  var convList = document.getElementById('llm-conv-list');
+  var convClose = document.getElementById('llm-conv-close');
 
   inp.value = sessionStorage.getItem(TEXT_KEY) || '';
 
+  // ---- Model selector -------------------------------------------------------
+  fetch('/models').then(function(r){ return r.json(); }).then(function(data) {
+    var saved = localStorage.getItem(MODEL_KEY) || data.current;
+    data.models.forEach(function(m) {
+      var opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.label;
+      if (m.id === saved) opt.selected = true;
+      msel.appendChild(opt);
+    });
+    // If saved model not in list, select current
+    if (!msel.value) msel.value = data.current;
+  }).catch(function(){});
+
+  msel.addEventListener('change', function() {
+    localStorage.setItem(MODEL_KEY, msel.value);
+    fetch('/set-model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: msel.value})
+    }).catch(function(){});
+  });
+
+  // ---- Busy state -----------------------------------------------------------
   function setBusy(on) {
     inp.disabled = send.disabled = on;
     stat.textContent = on ? 'Generating…' : '';
@@ -134,6 +234,7 @@ _INPUT_BAR = """\
 
   if (sessionStorage.getItem(BUSY_KEY)) setBusy(true);
 
+  // ---- SSE ------------------------------------------------------------------
   var es = new EventSource('/events');
   es.onmessage = function (e) {
     if (e.data === 'reload') {
@@ -146,6 +247,7 @@ _INPUT_BAR = """\
   };
   es.onerror = function () { setTimeout(function () { location.reload(); }, 2000); };
 
+  // ---- Send -----------------------------------------------------------------
   function doSend() {
     var text = inp.value.trim();
     if (!text || inp.disabled) return;
@@ -164,6 +266,8 @@ _INPUT_BAR = """\
   inp.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSend(); }
   });
+
+  // ---- New conversation -----------------------------------------------------
   nw.addEventListener('click', function () {
     fetch('/reset', {method: 'POST'});
     sessionStorage.removeItem(BUSY_KEY);
@@ -171,6 +275,105 @@ _INPUT_BAR = """\
     setBusy(false);
     inp.value = '';
   });
+
+  // ---- Conversations panel --------------------------------------------------
+  function openPanel() {
+    panel.style.display = 'flex';
+    overlay.style.display = 'block';
+    loadConversations();
+  }
+  function closePanel() {
+    panel.style.display = 'none';
+    overlay.style.display = 'none';
+  }
+
+  hist.addEventListener('click', openPanel);
+  overlay.addEventListener('click', closePanel);
+  convClose.addEventListener('click', closePanel);
+
+  function fmtDate(iso) {
+    var d = new Date(iso);
+    return d.toLocaleDateString(undefined, {month:'short', day:'numeric'})
+      + ' ' + d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+  }
+
+  function loadConversations() {
+    convList.innerHTML = '<div id="llm-conv-loading">Loading…</div>';
+    fetch('/conversations').then(function(r){ return r.json(); }).then(function(convs) {
+      convList.innerHTML = '';
+      if (!convs.length) {
+        convList.innerHTML = '<div id="llm-conv-empty">No conversations yet.</div>';
+        return;
+      }
+      fetch('/current-conversation').then(function(r){ return r.json(); }).then(function(cur) {
+        convs.forEach(function(c) {
+          var item = document.createElement('div');
+          item.className = 'conv-item' + (c.id === cur.id ? ' active' : '');
+
+          var info = document.createElement('div');
+          info.className = 'conv-info';
+
+          var name = document.createElement('div');
+          name.className = 'conv-name';
+          name.textContent = c.name || c.first_prompt || c.id;
+
+          var meta = document.createElement('div');
+          meta.className = 'conv-meta';
+          meta.textContent = fmtDate(c.datetime) + ' · ' + (c.model || '').replace('anthropic/', '');
+
+          info.appendChild(name);
+          info.appendChild(meta);
+
+          var del = document.createElement('button');
+          del.className = 'conv-del';
+          del.title = 'Delete conversation';
+          del.textContent = '✕';
+          del.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (!confirm('Delete this conversation?')) return;
+            fetch('/delete-conversation', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({id: c.id})
+            }).then(function() { loadConversations(); }).catch(function(){});
+          });
+
+          item.appendChild(info);
+          item.appendChild(del);
+
+          item.addEventListener('click', function() {
+            fetch('/load-conversation', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({id: c.id})
+            }).then(function(r) {
+              if (r.ok) {
+                closePanel();
+                sessionStorage.removeItem(BUSY_KEY);
+                setBusy(false);
+              }
+            }).catch(function(){});
+          });
+
+          convList.appendChild(item);
+        });
+      }).catch(function() {
+        // If no current conversation endpoint, just render without active marker
+        convs.forEach(function(c) {
+          var item = document.createElement('div');
+          item.className = 'conv-item';
+          item.innerHTML = '<div class="conv-info"><div class="conv-name">'
+            + (c.name || c.first_prompt || c.id).replace(/</g,'&lt;')
+            + '</div><div class="conv-meta">' + fmtDate(c.datetime)
+            + ' &middot; ' + (c.model||'').replace('anthropic/','')
+            + '</div></div>';
+          convList.appendChild(item);
+        });
+      });
+    }).catch(function() {
+      convList.innerHTML = '<div id="llm-conv-empty">Failed to load conversations.</div>';
+    });
+  }
 })();
 </script>"""
 
@@ -231,10 +434,25 @@ def _watch(md_file: str, interval: float = 0.8) -> None:
 # llm-conv runner
 # ---------------------------------------------------------------------------
 
+def _latest_conv_id() -> str | None:
+    r = subprocess.run(
+        ['llm', 'logs', 'list', '-n', '1', '--json'],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout)[0]['conversation_id']
+    except Exception:
+        return None
+
+
 def _run_llm(prompt: str) -> None:
-    global _running, _conversation_started
+    global _running, _conversation_started, _current_conv_id
     llm_conv = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm-conv')
-    args = [llm_conv]
+    with _model_lock:
+        model = _current_model
+    args = [llm_conv, '-m', model]
     with _conv_lock:
         if _conversation_started:
             args.append('-c')
@@ -250,14 +468,116 @@ def _run_llm(prompt: str) -> None:
             _conversation_started = True
         with _running_lock:
             _running = False
+        cid = _latest_conv_id()
+        if cid:
+            with _conv_id_lock:
+                _current_conv_id = cid
         _broadcast('done')
+
+
+# ---------------------------------------------------------------------------
+# Helper: get conversations from llm logs
+# ---------------------------------------------------------------------------
+
+def _get_conversations(limit: int = 50) -> list[dict]:
+    result = subprocess.run(
+        ['llm', 'logs', 'list', '-n', str(limit * 5), '--json'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        entries = json.loads(result.stdout)
+    except Exception:
+        return []
+
+    seen: dict[str, dict] = {}
+    for e in entries:
+        cid = e.get('conversation_id')
+        if not cid or cid in seen:
+            continue
+        name = e.get('conversation_name') or ''
+        first_prompt = (e.get('prompt') or '')[:80]
+        seen[cid] = {
+            'id': cid,
+            'name': name,
+            'first_prompt': first_prompt,
+            'model': e.get('conversation_model') or e.get('model') or '',
+            'datetime': e.get('datetime_utc', ''),
+        }
+        if len(seen) >= limit:
+            break
+    return list(seen.values())
+
+
+def _get_models() -> list[dict]:
+    result = subprocess.run(
+        ['llm', 'models', 'list'],
+        capture_output=True, text=True
+    )
+    models = []
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith('Default:'):
+                continue
+            # Format: "Provider: model-id (aliases: ...)"
+            m = re.match(r'^[^:]+:\s+(\S+)', line)
+            if not m:
+                continue
+            model_id = m.group(1)
+            # Extract aliases
+            alias_m = re.search(r'\(aliases:\s*([^)]+)\)', line)
+            if alias_m:
+                aliases = [a.strip() for a in alias_m.group(1).split(',')]
+                label = aliases[0]  # use shortest/friendliest alias
+            else:
+                label = model_id
+            models.append({'id': model_id, 'label': label})
+    return models
+
+
+def _load_conversation_to_file(conv_id: str) -> bool:
+    """Rewrite _md_file from a past conversation's log."""
+    result = subprocess.run(
+        ['llm', 'logs', 'list', '--conversation', conv_id, '-n', '0', '--json'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    try:
+        entries = json.loads(result.stdout)
+    except Exception:
+        return False
+    lines = ['# Conversation']
+    for entry in entries:
+        prompt = entry.get('prompt') or ''
+        response = entry.get('response') or ''
+        lines.append('\n---\n')
+        lines.append(f'**You:** {prompt}\n')
+        lines.append(f'**Assistant:**\n\n{response}')
+    with open(_md_file, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    return True
 
 
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
+_current_conv_id: str | None = None
+_conv_id_lock = threading.Lock()
+
+
 class _Handler(BaseHTTPRequestHandler):
+    def _json_response(self, data, status: int = 200) -> None:
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         if self.path == "/":
             with _html_lock:
@@ -292,18 +612,34 @@ class _Handler(BaseHTTPRequestHandler):
                 with _clients_lock:
                     _clients.discard(q)
 
+        elif self.path == "/models":
+            models = _get_models()
+            with _model_lock:
+                current = _current_model
+            self._json_response({'models': models, 'current': current})
+
+        elif self.path == "/conversations":
+            convs = _get_conversations()
+            self._json_response(convs)
+
+        elif self.path == "/current-conversation":
+            with _conv_id_lock:
+                cid = _current_conv_id
+            self._json_response({'id': cid})
+
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self) -> None:
-        global _running, _conversation_started
+        global _running, _conversation_started, _current_model, _current_conv_id
+
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length)
 
         if self.path == "/send":
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
             try:
-                prompt = json.loads(body).get('prompt', '').strip()
+                prompt = json.loads(raw).get('prompt', '').strip()
             except Exception:
                 self.send_response(400)
                 self.end_headers()
@@ -328,9 +664,70 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/reset":
             with _conv_lock:
                 _conversation_started = False
+            with _conv_id_lock:
+                _current_conv_id = None
             with open(_md_file, 'w') as f:
                 f.write('# Conversation\n\n')
             self.send_response(200)
+            self.end_headers()
+
+        elif self.path == "/set-model":
+            try:
+                model = json.loads(raw).get('model', '').strip()
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if model:
+                with _model_lock:
+                    _current_model = model
+            self.send_response(200)
+            self.end_headers()
+
+        elif self.path == "/load-conversation":
+            try:
+                conv_id = json.loads(raw).get('id', '').strip()
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if not conv_id:
+                self.send_response(400)
+                self.end_headers()
+                return
+            ok = _load_conversation_to_file(conv_id)
+            if ok:
+                with _conv_lock:
+                    _conversation_started = True
+                with _conv_id_lock:
+                    _current_conv_id = conv_id
+                self.send_response(200)
+            else:
+                self.send_response(500)
+            self.end_headers()
+
+        elif self.path == "/delete-conversation":
+            try:
+                conv_id = json.loads(raw).get('id', '').strip()
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                db_path = subprocess.run(
+                    ['llm', 'logs', 'path'], capture_output=True, text=True
+                ).stdout.strip()
+                con = sqlite3.connect(db_path)
+                con.execute('DELETE FROM responses WHERE conversation_id = ?', (conv_id,))
+                con.execute('DELETE FROM conversations WHERE id = ?', (conv_id,))
+                con.commit()
+                con.close()
+                with _conv_id_lock:
+                    if _current_conv_id == conv_id:
+                        _current_conv_id = None
+                self.send_response(200)
+            except Exception:
+                self.send_response(500)
             self.end_headers()
 
         else:
