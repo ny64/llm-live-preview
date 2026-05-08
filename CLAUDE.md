@@ -36,11 +36,13 @@ HTML is injected directly into pandoc output: `_EXTRA_CSS` and `_INPUT_BAR` (whi
 | GET | `/models` | List from `llm models list` + current model |
 | GET | `/conversations` | Last 50 conversations from `llm logs list` |
 | GET | `/current-conversation` | Active conversation ID |
+| GET | `/messages` | Ordered `[{id, prompt}]` for the active conversation |
 | POST | `/send` | Submit a prompt (409 if busy) |
 | POST | `/reset` | Clear file and start fresh conversation |
 | POST | `/set-model` | Change active model |
 | POST | `/load-conversation` | Rewrite file from a past conversation's logs |
 | POST | `/delete-conversation` | Delete from llm's SQLite DB directly |
+| POST | `/truncate-from` | Delete a response and all after it; rewrites the file |
 
 ### llm-conv (bash script)
 
@@ -54,6 +56,12 @@ Reads `LLM_PREVIEW_FILE` env var (set by `preview.py`) to know where to write.
 
 `preview.py` tracks whether a conversation has started (`_conversation_started`) to decide whether to pass `-c` (continue) to `llm-conv`. Loading a past conversation via `/load-conversation` sets `_conversation_started = True` and records the conversation ID; `/reset` clears both.
 
-### Delete implementation note
+### Delete and truncate implementation note
 
-`llm` has no `logs delete` subcommand. Deletion goes directly to the SQLite database at the path returned by `llm logs path`, deleting from both `responses` and `conversations` tables.
+`llm` has no `logs delete` subcommand. Deletion goes directly to the SQLite database at the path returned by `llm logs path`, operating on the `responses` and `conversations` tables.
+
+`/delete-conversation` removes all responses and the conversation record. `/truncate-from` takes a response ID, deletes it and all later responses in the same conversation (ordered by `datetime_utc`), then rewrites the markdown file from the remaining entries — or if no entries remain, resets state fully (same effect as `/reset`). The file rewrite triggers the watcher, which broadcasts `reload` to the browser.
+
+### Message-level delete buttons
+
+On each page load and on every `done` SSE event, the browser JS calls `injectDeleteButtons()`: it fetches `/messages`, finds every `<p>` containing `<strong>You:</strong>` (the pandoc rendering of `**You:**`), and appends a ✂ button to each. The Nth button corresponds to the Nth entry from `/messages`. Clicking it POSTs to `/truncate-from` with that entry's ID, which causes the page to reload automatically via the file watcher.

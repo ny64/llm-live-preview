@@ -181,6 +181,12 @@ _INPUT_BAR = """\
 .conv-del:hover { color: #c0392b; background: #fdecea; }
 #llm-conv-empty { padding: 1.5rem 1rem; font-family: sans-serif; font-size: 0.88rem; color: #999; }
 #llm-conv-loading { padding: 1rem; font-family: sans-serif; font-size: 0.85rem; color: #aaa; }
+.msg-del {
+  margin-left: 0.5rem; background: none; border: 1px solid #e0e0e0;
+  color: #ccc; cursor: pointer; font-size: 0.75rem;
+  padding: 0.1rem 0.35rem; border-radius: 3px; vertical-align: middle; line-height: 1;
+}
+.msg-del:hover { color: #c0392b; border-color: #c0392b; background: #fdecea; }
 </style>
 
 <script>
@@ -243,6 +249,7 @@ _INPUT_BAR = """\
     } else if (e.data === 'done') {
       setBusy(false);
       sessionStorage.removeItem(TEXT_KEY);
+      injectDeleteButtons();
     }
   };
   es.onerror = function () { setTimeout(function () { location.reload(); }, 2000); };
@@ -374,6 +381,37 @@ _INPUT_BAR = """\
       convList.innerHTML = '<div id="llm-conv-empty">Failed to load conversations.</div>';
     });
   }
+  // ---- Delete from message ------------------------------------------------
+  function injectDeleteButtons() {
+    document.querySelectorAll('.msg-del').forEach(function(b) { b.remove(); });
+    fetch('/messages').then(function(r) { return r.json(); }).then(function(msgs) {
+      if (!msgs.length) return;
+      var youParas = Array.from(document.querySelectorAll('p')).filter(function(p) {
+        var s = p.querySelector('strong');
+        return s && s.textContent === 'You:';
+      });
+      youParas.forEach(function(p, i) {
+        if (i >= msgs.length) return;
+        var btn = document.createElement('button');
+        btn.className = 'msg-del';
+        btn.title = 'Delete from here';
+        btn.textContent = '✂';
+        (function(msgId) {
+          btn.addEventListener('click', function() {
+            if (!confirm('Delete this message and all following?')) return;
+            fetch('/truncate-from', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({id: msgId})
+            }).catch(function(){});
+          });
+        })(msgs[i].id);
+        p.appendChild(btn);
+      });
+    }).catch(function(){});
+  }
+
+  injectDeleteButtons();
 })();
 </script>"""
 
@@ -627,6 +665,24 @@ class _Handler(BaseHTTPRequestHandler):
                 cid = _current_conv_id
             self._json_response({'id': cid})
 
+        elif self.path == "/messages":
+            with _conv_id_lock:
+                cid = _current_conv_id
+            msgs = []
+            if cid:
+                r = subprocess.run(
+                    ['llm', 'logs', 'list', '--conversation', cid, '-n', '0', '--json'],
+                    capture_output=True, text=True
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    try:
+                        entries = json.loads(r.stdout)
+                        msgs = [{'id': e['id'], 'prompt': (e.get('prompt') or '')[:80]}
+                                for e in entries]
+                    except Exception:
+                        pass
+            self._json_response(msgs)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -725,6 +781,63 @@ class _Handler(BaseHTTPRequestHandler):
                 with _conv_id_lock:
                     if _current_conv_id == conv_id:
                         _current_conv_id = None
+                self.send_response(200)
+            except Exception:
+                self.send_response(500)
+            self.end_headers()
+
+        elif self.path == "/truncate-from":
+            try:
+                resp_id = json.loads(raw).get('id', '').strip()
+            except Exception:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if not resp_id:
+                self.send_response(400)
+                self.end_headers()
+                return
+            with _conv_id_lock:
+                cid = _current_conv_id
+            if not cid:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                db_path = subprocess.run(
+                    ['llm', 'logs', 'path'], capture_output=True, text=True
+                ).stdout.strip()
+                con = sqlite3.connect(db_path)
+                rows = con.execute(
+                    'SELECT id FROM responses WHERE conversation_id = ? ORDER BY datetime_utc',
+                    (cid,)
+                ).fetchall()
+                ids = [r[0] for r in rows]
+                if resp_id not in ids:
+                    con.close()
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                cut = ids.index(resp_id)
+                to_delete = ids[cut:]
+                con.execute(
+                    'DELETE FROM responses WHERE id IN ({})'.format(','.join('?' * len(to_delete))),
+                    to_delete
+                )
+                if cut == 0:
+                    con.execute('DELETE FROM conversations WHERE id = ?', (cid,))
+                    con.commit()
+                    con.close()
+                    with _conv_lock:
+                        _conversation_started = False
+                    with _conv_id_lock:
+                        _current_conv_id = None
+                    with open(_md_file, 'w') as f:
+                        f.write('# Conversation\n\n')
+                else:
+                    con.commit()
+                    con.close()
+                    _load_conversation_to_file(cid)
                 self.send_response(200)
             except Exception:
                 self.send_response(500)
