@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Convert llm CLI conversations to PDF."""
+
+import argparse
+import json
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+
+MAINFONT = "TeX Gyre Pagella"
+MONOFONT = "TeX Gyre Cursor"
+
+
+def run_llm_logs(args):
+    cmd = ["llm", "logs", "list", "--json"] + args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error running llm: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(result.stdout)
+
+
+def list_conversations(count=20):
+    entries = run_llm_logs(["-n", str(count)])
+    # Group by conversation_id, preserving order of first occurrence
+    seen = {}
+    ordered = []
+    for e in entries:
+        cid = e["conversation_id"]
+        if cid not in seen:
+            seen[cid] = {
+                "id": cid,
+                "name": e.get("conversation_name") or "(unnamed)",
+                "model": e.get("model") or "",
+                "turns": 0,
+                "latest": e["datetime_utc"],
+            }
+            ordered.append(cid)
+        seen[cid]["turns"] += 1
+        if e["datetime_utc"] > seen[cid]["latest"]:
+            seen[cid]["latest"] = e["datetime_utc"]
+
+    print(f"{'#':<3} {'Conversation ID':<30} {'Turns':<6} {'Name'}")
+    print("-" * 90)
+    for i, cid in enumerate(ordered, 1):
+        c = seen[cid]
+        name = c["name"][:50]
+        print(f"{i:<3} {cid:<30} {c['turns']:<6} {name}")
+
+
+def fetch_conversation(cid):
+    entries = run_llm_logs(["--cid", cid, "-n", "0"])
+    # Sort by datetime to ensure correct order
+    entries.sort(key=lambda e: e["datetime_utc"])
+    return entries
+
+
+def fix_latex(text):
+    """Convert LLM-style LaTeX delimiters to pandoc-compatible ones."""
+    # Order matters: do display math before inline to avoid partial matches
+    text = re.sub(r'\\\[', '$$', text)
+    text = re.sub(r'\\\]', '$$', text)
+    text = re.sub(r'\\\( ', '$', text)
+    text = re.sub(r'\\\(', '$', text)
+    text = re.sub(r' \\\)', '$', text)
+    text = re.sub(r'\\\)', '$', text)
+    return text
+
+
+def build_markdown(entries, exclude=None):
+    """Build a markdown document from conversation entries."""
+    exclude_set = set(exclude) if exclude else set()
+    lines = []
+
+    conv_name = entries[0].get("conversation_name") or "Conversation"
+    model = entries[0].get("model") or ""
+    first_dt = entries[0]["datetime_utc"]
+
+    lines.append(f"# {conv_name}\n")
+    lines.append(f"*Model: {model}*  ")
+
+    try:
+        dt = datetime.fromisoformat(first_dt.replace("Z", "+00:00"))
+        formatted = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+        lines.append(f"*Date: {formatted}*\n")
+    except Exception:
+        pass
+
+    lines.append("")
+
+    for i, entry in enumerate(entries, 1):
+        if i in exclude_set:
+            continue
+
+        prompt = fix_latex(entry.get("prompt") or "")
+        response = fix_latex(entry.get("response") or "")
+
+        lines.append(f"## Q{i}")
+        lines.append("")
+        lines.append(prompt)
+        lines.append("")
+        lines.append(f"## A{i}")
+        lines.append("")
+        lines.append(response)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def convert_to_pdf(markdown_text, output_path):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(markdown_text)
+        tmp_path = f.name
+
+    try:
+        cmd = [
+            "pandoc", "-s",
+            "-f", "markdown+hard_line_breaks",
+            tmp_path,
+            "-V", f'geometry:top=1in,bottom=1in,left=1in,right=1in',
+            "-V", f"mainfont={MAINFONT}",
+            "-V", f"monofont={MONOFONT}",
+            "-V", "linestretch=1.2",
+            "--wrap=preserve",
+            "--pdf-engine=xelatex",
+            "--highlight-style=tango",
+            "-o", output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("pandoc error:", result.stderr, file=sys.stderr)
+            sys.exit(1)
+    finally:
+        os.unlink(tmp_path)
+
+
+def open_pdf(path):
+    subprocess.Popen(["xdg-open", path],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def get_db_path():
+    result = subprocess.run(["llm", "logs", "path"], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def delete_turns(cid, turn_numbers):
+    entries = fetch_conversation(cid)
+    if not entries:
+        print(f"No entries found for conversation {cid}", file=sys.stderr)
+        sys.exit(1)
+
+    to_delete = []
+    for n in turn_numbers:
+        if n < 1 or n > len(entries):
+            print(f"Turn {n} out of range (conversation has {len(entries)} turns)", file=sys.stderr)
+            sys.exit(1)
+        to_delete.append(entries[n - 1])
+
+    print("Will permanently delete:")
+    for e in to_delete:
+        preview = (e.get("prompt") or "")[:80].replace("\n", " ")
+        print(f"  [{e['datetime_utc'][:19]}] {preview}")
+
+    answer = input("Confirm deletion? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Aborted.")
+        return
+
+    db_path = get_db_path()
+    db = sqlite3.connect(db_path)
+    try:
+        for e in to_delete:
+            rid = e["id"]
+            db.execute("DELETE FROM prompt_fragments WHERE response_id = ?", (rid,))
+            db.execute("DELETE FROM system_fragments WHERE response_id = ?", (rid,))
+            db.execute("DELETE FROM tool_calls WHERE response_id = ?", (rid,))
+            db.execute("DELETE FROM tool_results WHERE response_id = ?", (rid,))
+            db.execute("DELETE FROM prompt_attachments WHERE response_id = ?", (rid,))
+            db.execute("DELETE FROM responses WHERE id = ?", (rid,))
+            print(f"Deleted turn {rid}")
+        db.commit()
+    finally:
+        db.close()
+
+    # If whole conversation is now empty, remove the conversation row too
+    remaining = fetch_conversation(cid)
+    if not remaining:
+        db = sqlite3.connect(db_path)
+        try:
+            db.execute("DELETE FROM conversations WHERE id = ?", (cid,))
+            db.commit()
+            print(f"Conversation {cid} is now empty and has been removed.")
+        finally:
+            db.close()
+
+
+def watch_conversation(cid, output_path, interval, exclude):
+    """Regenerate PDF whenever the conversation gains new turns."""
+    def snapshot_key(entries):
+        # Use the id of the last entry as a change sentinel
+        return entries[-1]["id"] if entries else None
+
+    def do_build(entries):
+        markdown = build_markdown(entries, exclude=exclude)
+        convert_to_pdf(markdown, output_path)
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] PDF updated ({len(entries)} turns) → {output_path}", flush=True)
+
+    print(f"Watching conversation {cid} (interval: {interval}s) — Ctrl+C to stop", flush=True)
+
+    entries = fetch_conversation(cid)
+    if not entries:
+        print(f"No entries found for conversation {cid}", file=sys.stderr)
+        sys.exit(1)
+
+    last_key = snapshot_key(entries)
+    do_build(entries)
+    open_pdf(output_path)
+
+    def handle_sigint(sig, frame):
+        print("\nStopped watching.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    while True:
+        time.sleep(interval)
+        entries = fetch_conversation(cid)
+        key = snapshot_key(entries)
+        if key != last_key:
+            last_key = key
+            do_build(entries)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert llm CLI conversations to PDF"
+    )
+    parser.add_argument(
+        "conversation_id",
+        nargs="?",
+        help="Conversation ID to convert (omit to list recent conversations)",
+    )
+    parser.add_argument(
+        "-l", "--list",
+        action="store_true",
+        help="List recent conversations",
+    )
+    parser.add_argument(
+        "--list-turns",
+        action="store_true",
+        help="List turns in the conversation without converting",
+    )
+    parser.add_argument(
+        "-x", "--exclude",
+        type=str,
+        default="",
+        help="Comma-separated turn numbers to exclude (e.g. 2,4)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        default="",
+        help="Output PDF path (default: conversation_<id>.pdf in current dir)",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Don't open the PDF after conversion",
+    )
+    parser.add_argument(
+        "-w", "--watch",
+        action="store_true",
+        help="Watch the conversation and rebuild PDF on new turns",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Polling interval for --watch (default: 5)",
+    )
+    parser.add_argument(
+        "-d", "--delete",
+        type=str,
+        default="",
+        help="Permanently delete turn(s) from the database (e.g. -d 3 or -d 2,4)",
+    )
+    args = parser.parse_args()
+
+    if args.list or not args.conversation_id:
+        list_conversations()
+        return
+
+    cid = args.conversation_id
+
+    if args.delete:
+        try:
+            turn_numbers = [int(x.strip()) for x in args.delete.split(",") if x.strip()]
+        except ValueError:
+            print("--delete must be comma-separated integers", file=sys.stderr)
+            sys.exit(1)
+        delete_turns(cid, turn_numbers)
+        return
+
+    entries = fetch_conversation(cid)
+
+    if not entries:
+        print(f"No entries found for conversation {cid}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.list_turns:
+        print(f"Turns in conversation {cid}:")
+        for i, e in enumerate(entries, 1):
+            prompt_preview = (e.get("prompt") or "")[:80].replace("\n", " ")
+            dt = e["datetime_utc"][:19]
+            print(f"  {i:>3}. [{dt}] {prompt_preview}")
+        return
+
+    exclude = []
+    if args.exclude:
+        try:
+            exclude = [int(x.strip()) for x in args.exclude.split(",") if x.strip()]
+        except ValueError:
+            print("--exclude must be comma-separated integers", file=sys.stderr)
+            sys.exit(1)
+
+    output_path = args.output or f"conversation_{cid}.pdf"
+
+    if args.watch:
+        watch_conversation(cid, output_path, args.interval, exclude)
+        return
+
+    markdown = build_markdown(entries, exclude=exclude)
+    print(f"Converting {len(entries)} turns → {output_path} ...", end=" ", flush=True)
+    convert_to_pdf(markdown, output_path)
+    print("done.")
+
+    if not args.no_open:
+        open_pdf(output_path)
+
+
+if __name__ == "__main__":
+    main()
