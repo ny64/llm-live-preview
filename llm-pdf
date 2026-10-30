@@ -14,9 +14,85 @@ import time
 from datetime import datetime, timezone
 
 
-MAINFONT = "TeX Gyre Pagella"
+MAINFONT = "DTL Documenta"
 MONOFONT = "TeX Gyre Cursor"
 
+UNICODE_TO_LATEX = {
+    "μ": r"$\mu$",
+    "σ": r"$\sigma$",
+    "α": r"$\alpha$",
+    "β": r"$\beta$",
+    "θ": r"$\theta$",
+    "λ": r"$\lambda$",
+    "∼": r"$\sim$",
+    "≥": r"$\geq$",
+    "≤": r"$\leq$",
+    "≠": r"$\neq$",
+    "→": r"$\rightarrow$",
+    "←": r"$\leftarrow$",
+    "∈": r"$\in$",
+    "∉": r"$\notin$",
+    "∞": r"$\infty$",
+    "∑": r"$\sum$",
+    "∏": r"$\prod$",
+    "∫": r"$\int$",
+    "√": r"$\sqrt{}$",
+    "∂": r"$\partial$",
+    "∇": r"$\nabla$",
+    "±": r"$\pm$",
+    "×": r"$\times$",
+    "÷": r"$\div$",
+    "∀": r"$\forall$",
+    "∃": r"$\exists$",
+    "⊂": r"$\subset$",
+    "⊃": r"$\supset$",
+    "∪": r"$\cup$",
+    "∩": r"$\cap$",
+    "∅": r"$\emptyset$",
+    "ℝ": r"$\mathbb{R}$",
+    "ℤ": r"$\mathbb{Z}$",
+    "ℕ": r"$\mathbb{N}$",
+    "ℚ": r"$\mathbb{Q}$",
+    "ℂ": r"$\mathbb{C}$",
+    "′": r"$'$",
+    "″": r"$''$",
+    "·": r"$\cdot$",
+    "‖": r"$\|$",
+    "⟨": r"$\langle$",
+    "⟩": r"$\rangle$",
+    "⌊": r"$\lfloor$",
+    "⌋": r"$\rfloor$",
+    "⌈": r"$\lceil$",
+    "⌉": r"$\rceil$",
+    # Subscript digits
+    "₀": r"$_0$",
+    "₁": r"$_1$",
+    "₂": r"$_2$",
+    "₃": r"$_3$",
+    "₄": r"$_4$",
+    "₅": r"$_5$",
+    "₆": r"$_6$",
+    "₇": r"$_7$",
+    "₈": r"$_8$",
+    "₉": r"$_9$",
+    # Superscript digits
+    "⁰": r"$^0$",
+    "¹": r"$^1$",
+    "²": r"$^2$",
+    "³": r"$^3$",
+    "⁴": r"$^4$",
+    "⁵": r"$^5$",
+    "⁶": r"$^6$",
+    "⁷": r"$^7$",
+    "⁸": r"$^8$",
+    "⁹": r"$^9$",
+}
+
+def fix_unicode_math(text):
+    """Replace bare Unicode math symbols with LaTeX equivalents."""
+    for char, latex in UNICODE_TO_LATEX.items():
+        text = text.replace(char, latex)
+    return text
 
 def run_llm_logs(args):
     cmd = ["llm", "logs", "list", "--json"] + args
@@ -75,33 +151,25 @@ def fix_latex(text):
 
 
 def build_markdown(entries, exclude=None):
-    """Build a markdown document from conversation entries."""
     exclude_set = set(exclude) if exclude else set()
     lines = []
-
     conv_name = entries[0].get("conversation_name") or "Conversation"
     model = entries[0].get("model") or ""
     first_dt = entries[0]["datetime_utc"]
-
     lines.append(f"# {conv_name}\n")
     lines.append(f"*Model: {model}*  ")
-
     try:
         dt = datetime.fromisoformat(first_dt.replace("Z", "+00:00"))
         formatted = dt.astimezone().strftime("%Y-%m-%d %H:%M")
         lines.append(f"*Date: {formatted}*\n")
     except Exception:
         pass
-
     lines.append("")
-
     for i, entry in enumerate(entries, 1):
         if i in exclude_set:
             continue
-
-        prompt = fix_latex(entry.get("prompt") or "")
-        response = fix_latex(entry.get("response") or "")
-
+        prompt = fix_unicode_math(fix_latex(entry.get("prompt") or ""))
+        response = fix_unicode_math(fix_latex(entry.get("response") or ""))
         lines.append(f"## Q{i}")
         lines.append("")
         lines.append(prompt)
@@ -112,9 +180,7 @@ def build_markdown(entries, exclude=None):
         lines.append("")
         lines.append("---")
         lines.append("")
-
     return "\n".join(lines)
-
 
 def convert_to_pdf(markdown_text, output_path):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
